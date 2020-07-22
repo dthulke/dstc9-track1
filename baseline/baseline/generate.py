@@ -125,7 +125,7 @@ def main():
     parser = argparse.ArgumentParser()
 
     # Required parameters
-    parser.add_argument("checkpoint", type=str, help="Saved checkpoint directory")
+    parser.add_argument("--checkpoint", type=str, help="Saved checkpoint directory")
     parser.add_argument('--generate', action='store_true')
     parser.add_argument("--generation_params_file", type=str, default="",
                         help="JSON configuration file for generation-related configurations.")

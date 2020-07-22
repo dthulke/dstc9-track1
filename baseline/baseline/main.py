@@ -57,8 +57,6 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-BASE_PATH = "/work/smt2/daheim/dstc9_baseline/"
-
 
 def get_classes(task):
     if task.lower() == "generation":
@@ -81,7 +79,7 @@ def set_seed(args):
 
 def train(args, train_dataset, eval_dataset, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, run_batch_fn_train, run_batch_fn_eval) -> Tuple[int, float]:
     if args.local_rank in [-1, 0]:
-        log_dir = os.path.join(BASE_PATH, "runs", args.exp_name) if args.exp_name else None
+        log_dir = os.path.join("runs", args.exp_name) if args.exp_name else None
         tb_writer = SummaryWriter(log_dir)
         args.output_dir = log_dir
 

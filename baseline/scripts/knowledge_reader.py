@@ -3,7 +3,10 @@ import json
 
 class KnowledgeReader(object):
     def __init__(self, dataroot, knowledge_file):
-        path = os.path.join(os.path.abspath(dataroot))
+        if dataroot is not None:
+            path = os.path.join(os.path.abspath(dataroot))
+        else:
+            path = ''
 
         with open(os.path.join(path, knowledge_file), 'r') as f:
             self.knowledge = json.load(f)

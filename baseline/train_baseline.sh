@@ -18,10 +18,10 @@ num_gpus=2
 # use --exp_name to specify the name of this run, the checkpoints and logs will be stored in runs/{exp_name}
 # use --eval_desc to specify the description of evaluation, which will be written in eval_results.txt
 
-python3 -m torch.distributed.launch --nproc_per_node ${num_gpus} /u/daheim/alexa-with-dstc9-track1-dataset/baseline.py \
-        --params_file /u/daheim/alexa-with-dstc9-track1-dataset/baseline/configs/detection/params.json \
-        --dataroot /u/daheim/alexa-with-dstc9-track1-dataset/data \
-        --exp_name ktd-${version}
+python3 -m torch.distributed.launch --nproc_per_node ${num_gpus} baseline.py \
+       --params_file baseline/configs/detection/params.json \
+       --dataroot data \
+       --exp_name ktd-${version}
 
 # Knowledge selection
 # use --negative_sample_method to modify the setting in params.json for this training run
@@ -29,14 +29,14 @@ python3 -m torch.distributed.launch --nproc_per_node ${num_gpus} /u/daheim/alexa
 # note that the default negative_sample_method for testing is "oracle"
 # which filters the candidates based on the ground truth entity, so the number of candidates
 # is way less than the total number of snippets
-python3 -m torch.distributed.launch --nproc_per_node ${num_gpus} /u/daheim/alexa-with-dstc9-track1-dataset/baseline.py \
+python3 -m torch.distributed.launch --nproc_per_node ${num_gpus} baseline.py \
     --negative_sample_method "all" \
-    --params_file /u/daheim/alexa-with-dstc9-track1-dataset/baseline/configs/selection/params.json \
-    --dataroot /u/daheim/alexa-with-dstc9-track1-dataset/data \
+    --params_file baseline/configs/selection/params.json \
+    --dataroot data \
     --exp_name ks-all-${version}
 
 # Response generation
-python3 -m torch.distributed.launch --nproc_per_node ${num_gpus} /u/daheim/alexa-with-dstc9-track1-dataset/baseline.py \
-    --params_file /u/daheim/alexa-with-dstc9-track1-dataset/baseline/configs/generation/params.json \
-    --dataroot /u/daheim/alexa-with-dstc9-track1-dataset/data \
+python3 -m torch.distributed.launch --nproc_per_node ${num_gpus} baseline.py \
+    --params_file baseline/configs/generation/params.json \
+    --dataroot data \
     --exp_name rg-hml128-kml128-${version}
