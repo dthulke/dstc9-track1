@@ -199,7 +199,7 @@ def evaluate(args, eval_dataset, model: PreTrainedModel, tokenizer: PreTrainedTo
     else:
         args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
 
-    eval_sampler = SequentialSampler(eval_dataset)
+    eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset, shuffle=False)
     eval_dataloader = DataLoader(
         eval_dataset,
         sampler=eval_sampler,
@@ -211,6 +211,11 @@ def evaluate(args, eval_dataset, model: PreTrainedModel, tokenizer: PreTrainedTo
     if args.n_gpu > 1 and (args.task != "selection" or eval_dataset.args.eval_all_snippets):
         if not isinstance(model, torch.nn.DataParallel):
             model = torch.nn.DataParallel(model)
+
+    if args.local_rank != -1:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True
+        )
 
     eval_loss = 0.0
     nb_eval_steps = 0
@@ -229,6 +234,30 @@ def evaluate(args, eval_dataset, model: PreTrainedModel, tokenizer: PreTrainedTo
             all_labels.append(mc_labels.detach().cpu().numpy())
             eval_loss += loss.mean().item()
         nb_eval_steps += 1
+
+    # Synchronize eval results between the nodes
+    # TODO there is probably a better method than dumping everything to the filesystem :)
+    if args.local_rank != -1:
+        import pickle
+        if args.local_rank != 0:
+            # Store results
+            process_results = eval_loss, nb_eval_steps, data_infos, all_preds, all_labels
+            with open(f'subprocess_{args.local_rank}_result.pickle', 'wb') as fp:
+                pickle.dump(process_results, fp)
+            torch.distributed.barrier()
+            return {}
+
+        if args.local_rank == 0:
+            # Block until all other processes finished
+            torch.distributed.barrier()
+            for i in range(1, torch.distributed.get_world_size()):
+                with open(f'subprocess_{i}_result.pickle', 'rb') as fp:
+                    process_results = pickle.load(fp)
+                    eval_loss += process_results[0]
+                    nb_eval_steps += process_results[1]
+                    data_infos += process_results[2]
+                    all_preds += process_results[3]
+                    all_labels += process_results[4]
 
     eval_loss = eval_loss / nb_eval_steps
 
@@ -343,6 +372,9 @@ def main():
     args.n_gpu = torch.cuda.device_count() if not args.distributed else 1
     args.device = device
 
+    logger = logging.getLogger(__name__)
+    logger.info("Running on {} GPU(s)".format(args.n_gpu))
+
     # Set seed
     set_seed(args)
 
@@ -400,10 +432,8 @@ def main():
             model.to(args.device)
 
     # Evaluation
-    result = {}
-    if args.local_rank in [-1, 0]:
-        eval_dataset = dataset_class(dataset_args, tokenizer, split_type=args.eval_dataset, labels=not args.no_labels, labels_file=args.labels_file)
-        result = evaluate(args, eval_dataset, model, tokenizer, run_batch_fn_eval, desc=args.eval_desc or "val")
+    eval_dataset = dataset_class(dataset_args, tokenizer, split_type=args.eval_dataset, labels=not args.no_labels, labels_file=args.labels_file)
+    result = evaluate(args, eval_dataset, model, tokenizer, run_batch_fn_eval, desc=args.eval_desc or "val")
 
     return result
 
