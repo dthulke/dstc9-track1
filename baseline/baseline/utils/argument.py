@@ -45,7 +45,10 @@ def set_attr_if_not_exists(args, name, value):
 
 
 def set_default_params(args):
-    pass
+    set_attr_if_not_exists(args, "multitask", False)
+    set_attr_if_not_exists(args, "embedding_loss", "triplet")
+    set_attr_if_not_exists(args, "is_rag_model", False)
+    set_attr_if_not_exists(args, "knowledge_encoder_checkpoint", "")
 
 
 def set_default_dataset_params(args):
@@ -55,3 +58,6 @@ def set_default_dataset_params(args):
     set_attr_if_not_exists(args, "history_max_utterances", 100000)
     set_attr_if_not_exists(args, "history_max_tokens", 128)
     set_attr_if_not_exists(args, "knowledge_max_tokens", 128)
+    set_attr_if_not_exists(args, "selection_type", "all")
+    set_attr_if_not_exists(args, "train_joint_selection_types", ["domain", "entity", "doc", "all"])
+    set_attr_if_not_exists(args, "include_full_knowledge", False)

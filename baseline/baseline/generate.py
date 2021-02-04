@@ -16,15 +16,16 @@ import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
-from transformers import AutoTokenizer, GPT2LMHeadModel
+from transformers import AutoTokenizer, GPT2PreTrainedModel, BartConfig
 
-from .dataset import ResponseGenerationEvalDataset, SPECIAL_TOKENS
+from .dataset import ResponseGenerationEvalDataset, KnowledgeEmbeddingDataset, SPECIAL_TOKENS, init_special_tokens_by_model
 from .utils.argument import (
     set_default_params,
     set_default_dataset_params,
     update_additional_params,
     verify_args
 )
+from .models import GPT2MultiTask
 from .utils.model import run_batch_generation_sample
 from .utils.metrics import (
     UnigramMetric, NGramDiversity,
@@ -32,7 +33,13 @@ from .utils.metrics import (
     BLEU, METEOR, ROUGE
 )
 from .utils.data import write_generation_preds
+from .main import get_model_class, update_args_by_model
 
+from .transformers.configuration_rag import RagConfig
+from .transformers.modeling_rag import RagToken
+from .transformers.retrieval_rag import KnowledgeIndex, RagRetriever
+
+from .utils.knowledge_embeddings import embed_knowledge
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -143,7 +150,7 @@ def main():
                         help="Device (cuda or cpu)")
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="Local rank for distributed training (-1: not distributed)")
-    args = parser.parse_args()
+    args, additional_args = parser.parse_known_args()
 
     # Setup logging
     logging.basicConfig(
@@ -151,6 +158,9 @@ def main():
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN,
     )
+
+    import nltk
+    nltk.download('punkt')
 
     # load args from params file and update the args Namespace
     args.params_file = os.path.join(args.checkpoint, "params.json")
@@ -166,9 +176,20 @@ def main():
         args = Namespace(**args)
     
     args.params = params # used for saving checkpoints
+    # reset parameter loaded from the training config
+
+    set_default_params(args)
     dataset_args = Namespace(**args.dataset_args)
     dataset_args.local_rank = args.local_rank
+    if args.task == "multitask":
+        args.multitask = True
+        dataset_args.multitask = True
+        args.task = "generation"
+    else:
+        args.multitask = False
+        dataset_args.multitask = False
     dataset_args.task = args.task
+    set_default_dataset_params(dataset_args)
 
     # Setup CUDA, GPU & distributed training
     args.distributed = (args.local_rank != -1)
@@ -190,14 +211,35 @@ def main():
 
     args.output_dir = args.checkpoint
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
-    model = GPT2LMHeadModel.from_pretrained(args.checkpoint)
+    model_class = get_model_class(args)
+    init_special_tokens_by_model(tokenizer)
+    tokenizer.add_special_tokens(SPECIAL_TOKENS)
+    model = model_class.from_pretrained(args.checkpoint)
     model.to(args.device)
+    config = model.config
+
+    update_args_by_model(args, dataset_args, model if not args.is_rag_model else model.model.generator)
+    args.tokenizer = tokenizer
 
     if args.local_rank == 0:
         torch.distributed.barrier()  # End of barrier to make sure only the first process in distributed training download model & vocab
 
     logger.info("Generation parameters %s", args)
-    
+
+    if args.is_rag_model:
+        logger.info("Build knowledge index")
+        with torch.no_grad():
+            knowledge_encoder = type(model.model.question_encoder).from_pretrained(args.knowledge_encoder_checkpoint).to(args.device)
+            knowledge_dataset = KnowledgeEmbeddingDataset(dataset_args, tokenizer, split_type='train', labels_file=args.labels_file)
+
+            embeddings, infos = embed_knowledge(args, knowledge_encoder, knowledge_dataset)
+            index = KnowledgeIndex(embeddings[0].shape[-1], embeddings, infos, knowledge_dataset.knowledge_reader)
+
+            del knowledge_encoder
+
+            args.retriever = RagRetriever(config, index=index)
+            args.retriever.generator_tokenizer = tokenizer
+
     # Evaluation
     result = {}
     if args.local_rank in [-1, 0]:

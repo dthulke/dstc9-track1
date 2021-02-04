@@ -5,6 +5,7 @@ import os
 import random
 import shutil
 import json
+import sys
 
 from typing import Dict, List, Tuple
 from argparse import Namespace
@@ -20,20 +21,36 @@ from transformers import (
     AdamW,
     AutoConfig,
     AutoTokenizer,
+    AutoModelForSequenceClassification,
+    AutoModelForSeq2SeqLM,
     GPT2DoubleHeadsModel,
+    GPT2PreTrainedModel,
     GPT2LMHeadModel,
     PreTrainedModel,
     PreTrainedTokenizer,
     get_linear_schedule_with_warmup,
+    BartConfig,
+    RobertaForMaskedLM
 )
 
 from .dataset import (
+    KnowledgeEmbeddingDataset,
     ResponseGenerationDataset,
     KnowledgeSelectionDataset,
     KnowledgeTurnDetectionDataset,
-    SPECIAL_TOKENS
+    EmbeddingDataset,
+    SPECIAL_TOKENS,
+    init_special_tokens_by_model,
 )
-from .models import GPT2ClsDoubleHeadsModel
+from .models import (
+    GPT2ClsDoubleHeadsModel,
+    GPT2ForSequenceClassificationModel,
+    GPT2MultiTask,
+    BartForSequenceEmbedding,
+    RobertaForSequenceEmbedding,
+    BartForMultitaskModeling,
+    RobertaForMultitaskModeling
+)
 from .utils.argument import (
     set_default_params,
     set_default_dataset_params,
@@ -44,10 +61,17 @@ from .utils.model import (
     run_batch_detection,
     run_batch_generation,
     run_batch_selection_train,
-    run_batch_selection_eval
+    run_batch_selection_eval,
+    run_batch_embedding,
 )
 from .utils.data import write_selection_preds, write_detection_preds
 
+from .transformers.configuration_rag import RagConfig
+from .transformers.modeling_rag import RagToken, RagForSequenceClassification
+from .transformers.retrieval_rag import KnowledgeIndex, RagRetriever
+
+from .utils.knowledge_embeddings import embed_knowledge
+from .utils.triplet_loss import batch_hard
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -58,15 +82,64 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-def get_classes(task):
-    if task.lower() == "generation":
-        return ResponseGenerationDataset, GPT2LMHeadModel, run_batch_generation, run_batch_generation
-    elif task.lower() == "selection":
-        return KnowledgeSelectionDataset, GPT2DoubleHeadsModel, run_batch_selection_train, run_batch_selection_eval
-    elif task.lower() == "detection":
-        return KnowledgeTurnDetectionDataset, GPT2ClsDoubleHeadsModel, run_batch_detection, run_batch_detection
+def get_model_class(args):
+    if args.task.lower == "multitask" or args.multitask:
+        if 'bart' in args.model_name_or_path:
+            return BartForMultitaskModeling
+        elif 'bert' in args.model_name_or_path:
+            return RobertaForMultitaskModeling
+        else:
+            return GPT2MultiTask
+
+    if args.task.lower() == "generation":
+        if args.is_rag_model:
+            return RagToken
+        return GPT2LMHeadModel if 'gpt' in args.model_name_or_path else AutoModelForSeq2SeqLM
+    elif args.task.lower() == "selection" or args.task.lower() == "detection":
+        if args.is_rag_model:
+            return RagForSequenceClassification
+        return GPT2ForSequenceClassificationModel if 'gpt' in args.model_name_or_path else AutoModelForSequenceClassification  # GPT2DoubleHeadsModel
+    elif args.task.lower() == "embedding":
+        return BartForSequenceEmbedding if 'bart' in args.model_name_or_path else RobertaForSequenceEmbedding
+    #elif args.task.lower() == "detection":
+    #    return GPT2ClsDoubleHeadsModel
     else:
-        raise ValueError("args.task not in ['generation', 'selection', 'detection'], got %s" % task)
+        raise ValueError("args.task not in ['generation', 'selection', 'detection'], got %s" % args.task)
+
+
+
+def get_classes(args):
+    model_class = get_model_class(args)
+    if args.task.lower() == "generation":
+        return ResponseGenerationDataset, model_class, run_batch_generation, run_batch_generation
+    elif args.task.lower() == "selection":
+        return KnowledgeSelectionDataset, model_class, run_batch_selection_train, run_batch_selection_eval
+    elif args.task.lower() == "detection":
+        return KnowledgeTurnDetectionDataset, model_class, run_batch_detection, run_batch_detection
+    elif args.task.lower() == "embedding":
+        return EmbeddingDataset, model_class, run_batch_embedding, run_batch_embedding
+    else:
+        raise ValueError("args.task not in ['generation', 'selection', 'detection'], got %s" % args.task)
+
+
+
+def update_args_by_model(args, dataset_args, model):
+    args.vocab_size = model.config.vocab_size
+    dataset_args.vocab_size = model.config.vocab_size
+    if isinstance(model, GPT2PreTrainedModel):
+        args.type_vocab_size = args.vocab_size
+        dataset_args.type_vocab_size = args.vocab_size
+    elif isinstance(model.config, BartConfig):
+        args.type_vocab_size = 0
+        dataset_args.type_vocab_size = 0
+    else:
+        args.type_vocab_size = model.config.type_vocab_size
+        dataset_args.type_vocab_size = model.config.type_vocab_size
+
+    # TODO generalize this to a model class
+    dataset_args.model_name_or_path = args.model_name_or_path
+    dataset_args.is_rag_model = args.is_rag_model
+    args.model_config = model.config
 
 
 def set_seed(args):
@@ -85,7 +158,7 @@ def train(args, train_dataset, eval_dataset, model: PreTrainedModel, tokenizer: 
 
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
 
-    train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
+    train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset, shuffle=True)
     train_dataloader = DataLoader(
         train_dataset,
         sampler=train_sampler,
@@ -119,6 +192,7 @@ def train(args, train_dataset, eval_dataset, model: PreTrainedModel, tokenizer: 
 
     # Train!
     global_step = 0
+    previous_checkpoint = None
     model.zero_grad()
     train_iterator = trange(
         0, int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0]
@@ -129,8 +203,14 @@ def train(args, train_dataset, eval_dataset, model: PreTrainedModel, tokenizer: 
         local_steps = 0
         tr_loss = 0.0
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+        total_steps = len(epoch_iterator)
+
         for step, batch in enumerate(epoch_iterator):
             model.train()
+            
+            if args.task == "embedding":
+                batch = batch_hard(args, model, batch)
+
             loss, _, _, _ = run_batch_fn_train(args, model, batch)
 
             if args.n_gpu > 1:
@@ -146,7 +226,7 @@ def train(args, train_dataset, eval_dataset, model: PreTrainedModel, tokenizer: 
 
             tr_loss += loss.item()
 
-            if (step + 1) % args.gradient_accumulation_steps == 0:
+            if (step + 1) % args.gradient_accumulation_steps == 0 or step + 1 == total_steps:
                 if args.fp16:
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
                 else:
@@ -158,7 +238,9 @@ def train(args, train_dataset, eval_dataset, model: PreTrainedModel, tokenizer: 
                 local_steps += 1
                 epoch_iterator.set_postfix(Loss=tr_loss/local_steps)
 
-        results = evaluate(args, eval_dataset, model, tokenizer, run_batch_fn_eval, desc=str(global_step))
+        #results = evaluate(args, eval_dataset, model, tokenizer, run_batch_fn_eval, desc=str(global_step))
+        results = {"Accuracy": .0}
+
         if args.local_rank in [-1, 0]:
             for key, value in results.items():
                 tb_writer.add_scalar("eval_{}".format(key), value, global_step)
@@ -182,6 +264,13 @@ def train(args, train_dataset, eval_dataset, model: PreTrainedModel, tokenizer: 
                 json.dump(args.params, jsonfile, indent=2, default=lambda x: str(x))
             logger.info("Saving model checkpoint to %s", output_dir)
 
+            if previous_checkpoint is not None:
+                # remove previous checkpoint if exists
+                if os.path.isdir(previous_checkpoint):
+                    shutil.rmtree(previous_checkpoint)
+
+            previous_checkpoint = output_dir
+
     if args.local_rank in [-1, 0]:
         tb_writer.close()
 
@@ -189,6 +278,7 @@ def train(args, train_dataset, eval_dataset, model: PreTrainedModel, tokenizer: 
 
 
 def evaluate(args, eval_dataset, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, run_batch_fn, desc="") -> Dict:
+    
     if args.local_rank in [-1, 0]:
         eval_output_dir = args.output_dir
         os.makedirs(eval_output_dir, exist_ok=True)
@@ -214,7 +304,7 @@ def evaluate(args, eval_dataset, model: PreTrainedModel, tokenizer: PreTrainedTo
 
     if args.local_rank != -1:
         model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True
+           model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True
         )
 
     eval_loss = 0.0
@@ -225,7 +315,7 @@ def evaluate(args, eval_dataset, model: PreTrainedModel, tokenizer: PreTrainedTo
     all_labels = []
     for batch in tqdm(eval_dataloader, desc="Evaluating", disable=args.local_rank not in [-1, 0]):
         with torch.no_grad():
-            loss, lm_logits, mc_logits, mc_labels = run_batch_fn(args, model, batch)
+            loss, _, mc_logits, mc_labels = run_batch_fn(args, model, batch)
             if args.task == "detection":
                 mc_logits = mc_logits.sigmoid()
             if args.task in ["selection", "detection"]:
@@ -271,8 +361,9 @@ def evaluate(args, eval_dataset, model: PreTrainedModel, tokenizer: PreTrainedTo
         logger.info("Avg. # of candidates: %f", sum([len(arr[0]) for arr in all_preds]) / len(all_preds))
         result = {"loss": eval_loss, "accuracy": accuracy}
         if args.output_file:
-            sorted_pred_ids = [np.argsort(logits.squeeze())[::-1] for logits in all_preds]
-            write_selection_preds(eval_dataset.dataset_walker, args.output_file, data_infos, sorted_pred_ids, topk=5)
+            scores = [logits.squeeze() for logits in all_preds]
+            sorted_pred_ids = [np.argsort(score)[::-1] for score in scores]
+            write_selection_preds(eval_dataset.dataset_walker, args.output_file, data_infos, sorted_pred_ids, scores, topk=100)
     elif args.task.lower() == "detection":
         all_labels = np.concatenate(all_labels)
         all_pred_ids = (np.concatenate(all_preds) > 0.5)
@@ -282,6 +373,30 @@ def evaluate(args, eval_dataset, model: PreTrainedModel, tokenizer: PreTrainedTo
         result = {"loss": eval_loss, "accuracy": accuracy, "precision": precision, "recall": recall}
         if args.output_file:
             write_detection_preds(eval_dataset.dataset_walker, args.output_file, data_infos, all_pred_ids)
+    elif args.task.lower() == "embedding":
+        correct_preds = 0
+        total_preds = 0
+
+        def embedding_dist(t1, t2):
+            if args.embedding_loss == "triplet":
+                return torch.cdist(t1, t2)
+            elif args.embedding_loss == "nll":
+                # Shape: batch_size, embedding_size
+                batch_size, embedding_size = t1.shape
+                return torch.bmm(
+                    t1.view(batch_size, 1, embedding_size),
+                    t2.view(batch_size, embedding_size, 1)
+                ).view(-1, 1)
+
+        for pred in all_preds:
+            pred_tensor = torch.tensor(pred)
+            _, batch_size, _ = pred_tensor.shape
+            correct_preds += torch.sum(
+                embedding_dist(pred_tensor[0], pred_tensor[1]) < embedding_dist(pred_tensor[0], pred_tensor[2])
+            ).item()
+
+        accuracy = correct_preds / len(all_preds)
+        result = {"loss": eval_loss, "accuracy": accuracy}
     else:
         raise ValueError("args.task not in ['generation', 'selection', 'detection'], got %s" % args.task)
 
@@ -334,14 +449,32 @@ def main():
                         help="Device (cuda or cpu)")
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="Local rank for distributed training (-1: not distributed)")
-    args = parser.parse_args()
+    parser.add_argument("--per_gpu_train_batch_random_sample", action='store_true')
+    args, additional_args = parser.parse_known_args()
 
     # Setup logging
+    streamHandler = logging.StreamHandler()
+    streamHandler.setLevel(logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d : %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN,
+        level=logging.INFO,
+        handlers=[
+            logging.FileHandler("run.log" if args.local_rank == -1 else f"run.{args.local_rank}.log"),
+            streamHandler
+        ]
     )
+    logger = logging.getLogger(__name__)
+
+    def excepthook_handler(type, value, tb):
+        if issubclass(type, KeyboardInterrupt):
+            sys.__excepthook__(type, value, tb)
+            return
+
+        logger.critical(f"Uncaught exception of type {type}: {value}", exc_info=(type, value, tb))
+        sys.__excepthook__(type, value, tb)
+    # Install exception handler
+    sys.excepthook = excepthook_handler
 
     verify_args(args, parser)
 
@@ -354,12 +487,14 @@ def main():
         args.update(params)
         args = Namespace(**args)
     
+    args.multitask = False
     args.params = params # used for saving checkpoints
     set_default_params(args)
     dataset_args = Namespace(**args.dataset_args)
     set_default_dataset_params(dataset_args)
     dataset_args.local_rank = args.local_rank
     dataset_args.task = args.task
+    dataset_args.multitask = False
 
     # Setup CUDA, GPU & distributed training
     args.distributed = (args.local_rank != -1)
@@ -372,7 +507,6 @@ def main():
     args.n_gpu = torch.cuda.device_count() if not args.distributed else 1
     args.device = device
 
-    logger = logging.getLogger(__name__)
     logger.info("Running on {} GPU(s)".format(args.n_gpu))
 
     # Set seed
@@ -382,27 +516,65 @@ def main():
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()  # Barrier to make sure only the first process in distributed training download model & vocab
 
-    dataset_class, model_class, run_batch_fn_train, run_batch_fn_eval = get_classes(args.task)
+    dataset_class, model_class, run_batch_fn_train, run_batch_fn_eval = get_classes(args)
 
     if args.eval_only:
         args.output_dir = args.checkpoint
         model = model_class.from_pretrained(args.checkpoint)
         tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
+        init_special_tokens_by_model(tokenizer)
+        tokenizer.add_special_tokens(SPECIAL_TOKENS)
     else:
         config = AutoConfig.from_pretrained(args.model_name_or_path)
         # set output_past to False for DataParallel to work during evaluation
         config.output_past = False
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+        config.num_labels = 1
+        if not args.is_rag_model:
+            tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(config.pretrained_generator_tokenizer_name_or_path)
+        init_special_tokens_by_model(tokenizer)
         tokenizer.add_special_tokens(SPECIAL_TOKENS)
-        model = model_class.from_pretrained(args.model_name_or_path, config=config)
-        model.resize_token_embeddings(len(tokenizer))
+        
+        model_init_kwargs = {}
+        if args.is_rag_model:
+            model_init_kwargs['generator_kwargs'] = {
+                'num_labels': 1
+            } 
 
+        model = model_class.from_pretrained(args.model_name_or_path, config=config, **model_init_kwargs)
+        if not args.is_rag_model:
+            model.resize_token_embeddings(len(tokenizer))
+        else:
+            model.model.generator.resize_token_embeddings(len(tokenizer))
+            model.config.title_sep = SPECIAL_TOKENS['additional_special_tokens'][2]
+            model.config.doc_sep = SPECIAL_TOKENS['additional_special_tokens'][3]
+
+    args.tokenizer = tokenizer
     model.to(args.device)
 
     if args.local_rank == 0:
         torch.distributed.barrier()  # End of barrier to make sure only the first process in distributed training download model & vocab
 
+    update_args_by_model(args, dataset_args, model if not args.is_rag_model else model.model.generator)
+
     logger.info("Training/evaluation parameters %s", args)
+
+
+    if args.is_rag_model:
+        logger.info("Build knowledge index")
+        with torch.no_grad():
+            knowledge_encoder = type(model.model.question_encoder).from_pretrained(args.knowledge_encoder_checkpoint).to(args.device)
+            knowledge_dataset = KnowledgeEmbeddingDataset(dataset_args, tokenizer, split_type='train', labels_file=args.labels_file)
+
+            embeddings, infos = embed_knowledge(args, knowledge_encoder, knowledge_dataset)
+            index = KnowledgeIndex(embeddings[0].shape[-1], embeddings, infos, knowledge_dataset.knowledge_reader)
+
+            del knowledge_encoder
+
+            args.retriever = RagRetriever(config, index=index)
+            args.retriever.generator_tokenizer = tokenizer
+
     if not args.eval_only:
         train_dataset = dataset_class(dataset_args, tokenizer, split_type="train")
         eval_dataset = dataset_class(dataset_args, tokenizer, split_type="val")
@@ -433,7 +605,8 @@ def main():
 
     # Evaluation
     eval_dataset = dataset_class(dataset_args, tokenizer, split_type=args.eval_dataset, labels=not args.no_labels, labels_file=args.labels_file)
-    result = evaluate(args, eval_dataset, model, tokenizer, run_batch_fn_eval, desc=args.eval_desc or "val")
+    #result = evaluate(args, eval_dataset, model, tokenizer, run_batch_fn_eval, desc=args.eval_desc or "val")
+    result = None
 
     return result
 

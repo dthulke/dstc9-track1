@@ -1,5 +1,5 @@
 import json
-from scripts.knowledge_reader import KnowledgeReader
+from knowledge_reader import KnowledgeReader
 
 def print_context(log):
     for utterance in log:
@@ -24,13 +24,15 @@ def analyze_errors(logs_file, knowledge_file, ref_file, pred_file):
                 for doc_id in pred_sample['knowledge']:
                     print(f"      {knowledge.get_doc(**doc_id)}")
                 print(f"  Ref response: {ref_sample['response']}")
-                print(f"  Pred response: {pred_sample['response']}")
-            elif ref_sample['target']:
+                if 'response' in pred_sample:
+                    print(f"  Pred response: {pred_sample['response']}")
+            elif ref_sample['target'] and 'response' in pred_sample:
                 print(f"Correct")
                 print_context(log)
                 print(f"    Doc: {knowledge.get_doc(**ref_sample['knowledge'][0])}")
-                print(f"  Ref response: {ref_sample['response']}")
-                print(f"  Pred response: {pred_sample['response']}")
+                if 'response' in pred_sample:
+                    print(f"  Ref response: {ref_sample['response']}")
+                    print(f"  Pred response: {pred_sample['response']}")
 
 if __name__ == "__main__":
     import argparse

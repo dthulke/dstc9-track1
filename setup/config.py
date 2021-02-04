@@ -1,8 +1,11 @@
 import sys
 import copy
+import os
 from math import sqrt
 import pathlib
 import json
+
+from recipe.baseline import RunMultitaskOnTrainJob, RerunSelectionSplit
 
 sys.setrecursionlimit(2500)
 
@@ -17,32 +20,32 @@ Path = tk.Path
 # ------------------------------ Recipes --------------------------------------
 
 from recipe.baseline import TrainBaselineJob, RunBaselineJob, ScoreBaselineJob
+from recipe.data import CreateLabelDifference, MakeTrueTargets, MergeSelectionLabels
+
 
 async def async_main():
-    config_path = pathlib.Path(gs.BASELINE_ROOT) / 'baseline' / 'configs'
+    # Baseline models
+    from config_baseline import main as baseline_main
+    baseline_main()
 
-    config_ktd = json.load(open(config_path / 'detection' / 'params.json'))
-    config_ks = json.load(open(config_path / 'selection' / 'params.json'))
-    config_rg = json.load(open(config_path / 'generation' / 'params.json'))
+    # Hierarchical Selection models
+    from config_hierarchical import main as hierarchical_main
+    hierarchical_main()
 
-    config_ktd['model_name_or_path'] = 'gpt2'
-    config_ks['model_name_or_path'] = 'gpt2'
-    config_rg['model_name_or_path'] = 'gpt2'
+    # Multi-task models
+    from config_multitask import main as multitask_main
+    multitask_main()
 
-    # Set negative sampling to all (to avoid --negative_sample_method "all")
-    config_ks['dataset_args']['negative_sample_method'] = "all"
+    # Retrieval Augmented Detection experiments
+    from config_retrieval_detection_embedding_nll import main as retrieval_detection_main
+    retrieval_detection_main()
 
-    train_ktd = TrainBaselineJob('ktd', config_ktd)
-    train_ks = TrainBaselineJob('ks', config_ks)
-    train_rg = TrainBaselineJob('rg-hml128-kml128', config_rg)
+    # Dense Knowledge Retrieval
+    from config_ra_embedding import main as rag_embedding_main
+    rag_embedding_main()
 
-    run_ktd = RunBaselineJob(train_ktd.checkpoint, additional_args="--eval_only")
-    run_ks = RunBaselineJob(train_ks.checkpoint, labels=run_ktd.preds, gpus=2, additional_args="--eval_only --eval_all_snippets")
-    run_rg = RunBaselineJob(train_rg.checkpoint, labels=run_ks.preds, additional_args=f"--generate --generation_params_file {config_path / 'generation/generation_params.json'}")
-    tk.register_output(f'baseline_val.json', run_rg.preds)
-
-    score_job = ScoreBaselineJob(run_rg.preds)
-    tk.register_output('baseline_val.score.json', score_job.scores)
+    from config_times import main as timer_main
+    timer_main()
 
 async def py():
     await async_main()

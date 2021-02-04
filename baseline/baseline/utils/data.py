@@ -5,6 +5,7 @@ import random
 import logging
 
 from tqdm import tqdm
+import numpy as np
 
 
 logger = logging.getLogger(__name__)
@@ -57,7 +58,7 @@ def write_detection_preds(dataset_walker, output_file, data_infos, pred_ids):
         json.dump(labels, jsonfile, indent=2)
 
 
-def write_selection_preds(dataset_walker, output_file, data_infos, sorted_pred_ids, topk=5):
+def write_selection_preds(dataset_walker, output_file, data_infos, sorted_pred_ids, scores=None, topk=5):
     # Flatten the data_infos
     data_infos = [
         {
@@ -71,19 +72,39 @@ def write_selection_preds(dataset_walker, output_file, data_infos, sorted_pred_i
     labels = [label for log, label in dataset_walker]
     new_labels = [{"target": False}] * len(dataset_walker)
     # Update the dialogs with selected knowledge
-    for info, sorted_pred_id in zip(data_infos, sorted_pred_ids):
+    for i, info, sorted_pred_id in zip(range(len(data_infos)), data_infos, sorted_pred_ids):
         dialog_id = info["dialog_id"]
         candidate_keys = info["candidate_keys"]
 
         snippets = []
-        for pred_id in sorted_pred_id[:topk]: 
-            selected_cand = candidate_keys[pred_id]
-            domain, entity_id, doc_id = selected_cand.split("__")
+        for pred_id in sorted_pred_id[:topk]:
+            score = None
+            if np.issubdtype(type(pred_id), np.integer):
+                selected_cand = candidate_keys[pred_id]
+                score = scores[i][pred_id]
+            elif isinstance(pred_id, str):
+                selected_cand = pred_id
+            elif isinstance(pred_id, tuple):
+                selected_cand = pred_id[0]
+                score = pred_id[1]
+            else:
+                raise Exception(f"Unexpected pred_id {pred_id}")
+            key_split = selected_cand.split("__")
+
+            domain = key_split[0]
             snippet = {
                 "domain": domain,
-                "entity_id": "*" if entity_id == "*" else int(entity_id),
-                "doc_id": int(doc_id)
             }
+            if len(key_split) > 1:
+                entity_id = key_split[1]
+                snippet['entity_id'] = "*" if entity_id == "*" else int(entity_id)
+            if len(key_split) > 2:
+                doc_id = key_split[2]
+                snippet['doc_id'] = int(doc_id)
+
+            if score is not None:
+                snippet['score'] = float(score)
+
             snippets.append(snippet)
         
         new_label = {"target": True, "knowledge": snippets}
@@ -153,3 +174,4 @@ def truncate_sequences(sequences, max_length):
     
     sequences[0] = sequences[0][words_to_cut:]
     return sequences
+    

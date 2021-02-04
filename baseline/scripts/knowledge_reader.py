@@ -75,7 +75,7 @@ class KnowledgeReader(object):
                     result.append({'domain': domain, 'entity_id': entity_id, 'entity_name': entity_name, 'doc_id': doc_id, 'doc': {'title': doc_obj['title'], 'body': doc_obj['body']}})
         return result
 
-    def get_doc(self, domain, entity_id, doc_id):
+    def get_doc(self, domain, entity_id, doc_id, **kwargs):
         if domain not in self.get_domain_list():
             raise ValueError("invalid domain name: %s" % domain)
 
@@ -91,3 +91,7 @@ class KnowledgeReader(object):
         result = {'domain': domain, 'entity_id': entity_id, 'entity_name': entity_name, 'doc_id': doc_id, 'doc': {'title': doc_obj['title'], 'body': doc_obj['body']}}
 
         return result
+
+    def get_doc_by_id(self, doc_id):
+        domain, entity_id, doc_id = doc_id.split('__')
+        return self.get_doc(domain, entity_id, doc_id)
